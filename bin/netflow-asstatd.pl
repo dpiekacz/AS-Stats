@@ -17,7 +17,7 @@ my $samplingrate = 1;	# rate for sampled NetFlow (or = 1 for unsampled)
 
 my $ascache = {};
 my $ascache_lastflush = 0;
-my $ascache_flush_interval = 25;
+my $ascache_flush_interval = 5;
 my $ascache_flush_number = 0;
 
 my $server_port = 9000;
@@ -189,7 +189,7 @@ sub parse_netflow_v9_template_flowset {
 
 		last if (!defined($template_id) || !defined($fldcount));
 
-		#print "Updated template ID $template_id (source ID $source_id, from " . inet_ntoa($ipaddr) . ")\n";
+		print "Updated template ID $template_id (source ID $source_id, from " . inet_ntoa($ipaddr) . ")\n";
 		my $template = [@template_ints[($i+2) .. ($i+2+$fldcount*2-1)]];
 		$v9_templates->{$ipaddr}->{$source_id}->{$template_id}->{'template'} = $template;
 		
@@ -213,7 +213,7 @@ sub parse_netflow_v9_data_flowset {
 	
 	my $template = $v9_templates->{$ipaddr}->{$source_id}->{$flowsetid}->{'template'};
 	if (!defined($template)) {
-		#print "Template ID $flowsetid from $source_id/" . inet_ntoa($ipaddr) . " does not (yet) exist\n";
+		print "Template ID $flowsetid from $source_id/" . inet_ntoa($ipaddr) . " does not (yet) exist\n";
 		return;
 	}
 	
@@ -329,7 +329,7 @@ sub parse_netflow_v10_template_flowset {
 
 		last if (!defined($template_id) || !defined($fldcount));
 
-		#print "Updated template ID $template_id (source ID $source_id, from " . inet_ntoa($ipaddr) . ")\n";
+		print "Updated template ID $template_id (source ID $source_id, from " . inet_ntoa($ipaddr) . ")\n";
 		my $template = [@template_ints[($i+2) .. ($i+2+$fldcount*2-1)]];
 
 		$v10_templates->{$ipaddr}->{$source_id}->{$template_id}->{'template'} = $template;
@@ -354,7 +354,7 @@ sub parse_netflow_v10_data_flowset {
 
 	my $template = $v10_templates->{$ipaddr}->{$source_id}->{$flowsetid}->{'template'};
 	if (!defined($template)) {
-		#print "Template ID $flowsetid from $source_id/" . inet_ntoa($ipaddr) . " does not (yet) exist\n";
+		print "Template ID $flowsetid from $source_id/" . inet_ntoa($ipaddr) . " does not (yet) exist\n";
 		return;
 	}
 	
@@ -434,7 +434,7 @@ sub handleflow {
 		return;
 	}
 	
-	#print "$srcas => $dstas ($noctets octets, version $ipversion, snmpin $snmpin, snmpout $snmpout)\n";
+	print "$srcas => $dstas ($noctets octets, version $ipversion, snmpin $snmpin, snmpout $snmpout)\n";
 	
 	# determine direction and interface alias name (if known)
 	my $direction;
@@ -511,7 +511,7 @@ sub flush_cache {
 
 	while (my ($as, $cacheent) = each(%$ascache)) {
 		if ($as % 10 == $ascache_flush_number % 10) {
-			#print "$$: flushing data for AS $as ($cacheent->{updatets})\n";
+			print "$$: flushing data for AS $as ($cacheent->{updatets})\n";
 		
 			my $rrdfile = getrrdfile($as, $cacheent->{updatets});
 			my @templatearg;
@@ -563,7 +563,7 @@ sub getrrdfile {
 
 	# let's see if there's already an RRD file for this AS - if not, create one
 	if (! -r $rrdfile) {
-		#print "$$: creating RRD file for AS $as\n";
+		print "$$: creating RRD file for AS $as\n";
 		
 		my %links = map { $_, 1 } values %knownlinks;
 		
