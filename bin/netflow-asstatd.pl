@@ -9,6 +9,8 @@ use strict;
 use IO::Socket;
 use RRDs;
 use Getopt::Std;
+use DBI;
+use Cache::Memcached;
 
 my %knownlinks;
 my %link_samplingrates;
@@ -31,6 +33,17 @@ my $v9_header_len = 20;
 my $v9_templates = {};
 my $v10_header_len = 16;
 my $v10_templates = {};
+
+my $my_asn = 65536;
+my $stats_mysql_query = 0;
+my $stats_mysql_notf = 0;
+my $stats_mysql_fail = 0;
+my $stats_memd_query = 0;
+my $stats_memd_hit = 0;
+
+my $memd = new Cache::Memcached { 'servers' => [ '127.0.0.1:11211', ], 'debug' => 0, 'compress_threshold' => 10_000, };
+my $dbh = DBI->connect("DBI:mysql:database=gixlg;mysql_socket=/tmp/mysqld.sock", "gixlg", "gixlg", {AutoCommit=>1,RaiseError=>0,PrintError=>0,HandleError=>\&dbi_handle_error});
+$dbh->{mysql_auto_reconnect} = 1;
 
 use vars qw/ %opt /;
 getopts('r:p:k:s:', \%opt);
@@ -73,7 +86,18 @@ sub REAPER {
 
 sub TERM {
 	print "SIGTERM received\n";
+	$dbh->disconnect();
 	exit 0;
+}
+
+sub DESTROY {
+	my ($self) = @_;
+	# Finish off our statement handle, so we don't get warnings like:
+	# DBI::db->disconnect invalidates 1 active statement handle
+	my $sth = $self->{data_handle};
+	if (blessed($sth) && $sth->can('finish')) {
+		$sth->finish;
+	}
 }
 
 # read known links file
@@ -89,11 +113,11 @@ my ($him,$datagram,$flags);
 while (1) {
 	$him = $server->recv($datagram, $MAXREAD);
 	next if (!$him);
-	
+
 	my ($port, $ipaddr) = sockaddr_in($server->peername);
 
 	my ($version) = unpack("n", $datagram);
-	
+
 	if ($version == 5) {
 		parse_netflow_v5($datagram, $ipaddr);
 	} elsif ($version == 8) {
@@ -106,29 +130,36 @@ while (1) {
 		print "unknown NetFlow version: $version\n";
 	}
 }
+
+sub dbi_handle_error {
+	my $error = shift;
+	$stats_mysql_fail++;
+	print "MYSQL error occured in the script, message: $error\n";
+	return 0;
+}
+
 sub parse_netflow_v5 {
 	my $datagram = shift;
 	my $ipaddr = shift;
-	
+
 	my ($version, $count, $sysuptime, $unix_secs, $unix_nsecs,
 	  $flow_sequence, $engine_type, $engine_id, $aggregation,
 	  $agg_version) = unpack("nnNNNNCCCC", $datagram);
 
 	my $flowrecs = substr($datagram, $v5_header_len);
-	
+
 	for (my $i = 0; $i < $count; $i++) {
 		my $flowrec = substr($datagram, $v5_header_len + ($i*$v5_flowrec_len), $v5_flowrec_len);
 		my @flowdata = unpack("NNNnnNNNNnnccccnnccN", $flowrec);
-		print "ipaddr: " . inet_ntoa($ipaddr) . " octets: $flowdata[6] srcas: $flowdata[15] dstas: $flowdata[16] in: $flowdata[3] out: $flowdata[4] 4 \n";
+		#print "ipaddr: " . inet_ntoa($ipaddr) . " octets: $flowdata[6] srcas: $flowdata[15] dstas: $flowdata[16] in: $flowdata[3] out: $flowdata[4] 4 \n";
 		handleflow($ipaddr, $flowdata[6], $flowdata[15], $flowdata[16], $flowdata[3], $flowdata[4], 4);
 	}
 }
 
-
 sub parse_netflow_v8 {
 	my $datagram = shift;
 	my $ipaddr = shift;
-	
+
 	my ($version, $count, $sysuptime, $unix_secs, $unix_nsecs,
 	  $flow_sequence, $engine_type, $engine_id, $aggregation,
 	  $agg_version) = unpack("nnNNNNCCCC", $datagram);
@@ -139,7 +170,7 @@ sub parse_netflow_v8 {
 	}
 
 	my $flowrecs = substr($datagram, $v8_header_len);
-	
+
 	for (my $i = 0; $i < $count; $i++) {
 		my $flowrec = substr($datagram, $v8_header_len + ($i*$v8_flowrec_len), $v8_flowrec_len);
 		my @flowdata = unpack("NNNNNnnnn", $flowrec);
@@ -150,10 +181,10 @@ sub parse_netflow_v8 {
 sub parse_netflow_v9 {
 	my $datagram = shift;
 	my $ipaddr = shift;
-	
+
 	# Parse packet
 	my ($version, $count, $sysuptime, $unix_secs, $seqno, $source_id, @flowsets) = unpack("nnNNNN(nnX4/a)*", $datagram);
-	
+
 	# Loop through FlowSets and take appropriate action
 	for (my $i = 0; $i < scalar @flowsets; $i += 2) {
 		my $flowsetid = $flowsets[$i];
@@ -168,7 +199,7 @@ sub parse_netflow_v9 {
 			parse_netflow_v9_data_flowset($flowsetid, $flowsetdata, $ipaddr, $source_id);
 		} else {
 			# reserved FlowSet
-			print "Unknown FlowSet ID $flowsetid found\n";
+			#print "Unknown FlowSet ID $flowsetid found\n";
 		}
 	}
 }
@@ -177,9 +208,9 @@ sub parse_netflow_v9_template_flowset {
 	my $templatedata = shift;
 	my $ipaddr = shift;
 	my $source_id = shift;
-	
+
 	# Note: there may be multiple templates in a Template FlowSet
-	
+
 	my @template_ints = unpack("n*", $templatedata);
 
 	my $i = 0;
@@ -189,18 +220,18 @@ sub parse_netflow_v9_template_flowset {
 
 		last if (!defined($template_id) || !defined($fldcount));
 
-		print "Updated template ID $template_id (source ID $source_id, from " . inet_ntoa($ipaddr) . ")\n";
+		#print "Updated template ID $template_id (source ID $source_id, from " . inet_ntoa($ipaddr) . ")\n";
 		my $template = [@template_ints[($i+2) .. ($i+2+$fldcount*2-1)]];
 		$v9_templates->{$ipaddr}->{$source_id}->{$template_id}->{'template'} = $template;
-		
+
 		# Calculate total length of template data
 		my $totallen = 0;
 		for (my $j = 1; $j < scalar @$template; $j += 2) {
 			$totallen += $template->[$j];
 		}
-		
+
 		$v9_templates->{$ipaddr}->{$source_id}->{$template_id}->{'len'} = $totallen;
-		
+
 		$i += (2 + $fldcount*2);
 	}
 }
@@ -210,33 +241,39 @@ sub parse_netflow_v9_data_flowset {
 	my $flowsetdata = shift;
 	my $ipaddr = shift;
 	my $source_id = shift;
-	
+
 	my $template = $v9_templates->{$ipaddr}->{$source_id}->{$flowsetid}->{'template'};
 	if (!defined($template)) {
-		print "Template ID $flowsetid from $source_id/" . inet_ntoa($ipaddr) . " does not (yet) exist\n";
+		#print "Template ID $flowsetid from $source_id/" . inet_ntoa($ipaddr) . " does not (yet) exist\n";
 		return;
 	}
-	
+
 	my $len = $v9_templates->{$ipaddr}->{$source_id}->{$flowsetid}->{'len'};
-	
+
 	my $ofs = 0;
 	my $datalen = length($flowsetdata);
 	while (($ofs + $len) <= $datalen) {
 		# Interpret values according to template
-		my ($inoctets, $outoctets, $srcas, $dstas, $snmpin, $snmpout, $ipversion);
+		my ($inoctets, $outoctets, $srcip, $dstip, $srcas, $dstas, $snmpin, $snmpout, $ipversion);
 
 		$inoctets = 0;
 		$outoctets = 0;
 		$ipversion = 4;
-		
+
 		for (my $i = 0; $i < scalar @$template; $i += 2) {
 			my $cur_fldtype = $template->[$i];
 			my $cur_fldlen = $template->[$i+1];
-		
+
 			my $cur_fldval = substr($flowsetdata, $ofs, $cur_fldlen);
 			$ofs += $cur_fldlen;
-		
-			if ($cur_fldtype == 16) {	# SRC_AS
+
+			if ($cur_fldtype == 8) {	# SRC_IP
+				my @src_tmp = unpack("C4", $cur_fldval);
+				$srcip = $src_tmp[0]*2**24 + $src_tmp[1]*2**16 + $src_tmp[2]*2**8 + $src_tmp[3];
+			} elsif ($cur_fldtype == 12) {	# DST_IP
+				my @dst_tmp = unpack("C4", $cur_fldval);
+				$dstip = $dst_tmp[0]*2**24 + $dst_tmp[1]*2**16 + $dst_tmp[2]*2**8 + $dst_tmp[3];
+			} elsif ($cur_fldtype == 16) {	# SRC_AS
 				if ($cur_fldlen == 2) {
 					$srcas = unpack("n", $cur_fldval);
 				} elsif ($cur_fldlen == 4) {
@@ -274,11 +311,15 @@ sub parse_netflow_v9_data_flowset {
 				}
 			} elsif ($cur_fldtype == 60) {	# IP_PROTOCOL_VERSION
 				$ipversion = unpack("C", $cur_fldval);
-			} elsif ($cur_fldtype == 27 || $cur_fldtype == 28) {	# IPV6_SRC_ADDR/IPV6_DST_ADDR
+			} elsif ($cur_fldtype == 27) {	# IPV6_SRC_ADDR
 				$ipversion = 6;
+				$srcip = unpack("H4"x8,$cur_fldval);
+			} elsif ($cur_fldtype == 28) {	# IPV6_DST_ADDR
+				$ipversion = 6;
+				$dstip = unpack("H4"x8,$cur_fldval);
 			}
 		}
-	
+
 		if (defined($srcas) && defined($dstas) && defined($snmpin) && defined($snmpout)) {
 			handleflow($ipaddr, $inoctets + $outoctets, $srcas, $dstas, $snmpin, $snmpout, $ipversion);
 		}
@@ -288,10 +329,10 @@ sub parse_netflow_v9_data_flowset {
 sub parse_netflow_v10 {
 	my $datagram = shift;
 	my $ipaddr = shift;
-	
+
 	# Parse packet
 	my ($version, $length, $sysuptime, $seqno, $source_id, @flowsets) = unpack("nnNNN(nnX4/a)*", $datagram);
-	
+
 	# Loop through FlowSets and take appropriate action
 	for (my $i = 0; $i < scalar @flowsets; $i += 2) {
 		my $flowsetid = $flowsets[$i];
@@ -307,7 +348,7 @@ sub parse_netflow_v10 {
 			parse_netflow_v10_data_flowset($flowsetid, $flowsetdata, $ipaddr, $source_id);
 		} else {
 			# reserved FlowSet
-			print "Unknown FlowSet ID $flowsetid found\n";
+			#print "Unknown FlowSet ID $flowsetid found\n";
 		}
 	}
 }
@@ -316,20 +357,20 @@ sub parse_netflow_v10_template_flowset {
 	my $templatedata = shift;
 	my $ipaddr = shift;
 	my $source_id = shift;
-	
+
 	# Note: there may be multiple templates in a Template FlowSet
-	
+
 	my @template_ints = unpack("n*", $templatedata);
 
 	my $i = 0;
 	while ($i < scalar @template_ints) {
-	
+
 		my $template_id = $template_ints[$i];
 		my $fldcount = $template_ints[$i+1];
 
 		last if (!defined($template_id) || !defined($fldcount));
 
-		print "Updated template ID $template_id (source ID $source_id, from " . inet_ntoa($ipaddr) . ")\n";
+		#print "Updated template ID $template_id (source ID $source_id, from " . inet_ntoa($ipaddr) . ")\n";
 		my $template = [@template_ints[($i+2) .. ($i+2+$fldcount*2-1)]];
 
 		$v10_templates->{$ipaddr}->{$source_id}->{$template_id}->{'template'} = $template;
@@ -354,22 +395,28 @@ sub parse_netflow_v10_data_flowset {
 
 	my $template = $v10_templates->{$ipaddr}->{$source_id}->{$flowsetid}->{'template'};
 	if (!defined($template)) {
-		print "Template ID $flowsetid from $source_id/" . inet_ntoa($ipaddr) . " does not (yet) exist\n";
+		#print "Template ID $flowsetid from $source_id/" . inet_ntoa($ipaddr) . " does not (yet) exist\n";
 		return;
 	}
-	
+
 	my $len = $v10_templates->{$ipaddr}->{$source_id}->{$flowsetid}->{'len'};
-	
+
 	my $ofs = 0;
 	my $datalen = length($flowsetdata);
+	my $sth;
+	my $rows = 0;
+
+	if ( not $dbh->ping ) {
+		print "MYSQL connection issue\n";
+	}
 	while (($ofs + $len) <= $datalen) {
 		# Interpret values according to template
-		my ($inoctets, $outoctets, $srcas, $dstas, $snmpin, $snmpout, $ipversion);
+		my ($inoctets, $outoctets, $srcip, $dstip, $srcas, $dstas, $srcas_tmp, $dstas_tmp, $snmpin, $snmpout, $ipversion);
 
 		$inoctets = 0;
 		$outoctets = 0;
 		$ipversion = 4;
-		
+
 		for (my $i = 0; $i < scalar @$template; $i += 2) {
 			my $cur_fldtype = $template->[$i];
 			my $cur_fldlen = $template->[$i+1];
@@ -377,7 +424,13 @@ sub parse_netflow_v10_data_flowset {
 			my $cur_fldval = substr($flowsetdata, $ofs, $cur_fldlen);
 			$ofs += $cur_fldlen;
 
-			if ($cur_fldtype == 16) {	# SRC_AS
+			if ($cur_fldtype == 8) {	# SRC_IP
+				my @src_tmp = unpack("C4", $cur_fldval);
+				$srcip = $src_tmp[0]*2**24 + $src_tmp[1]*2**16 + $src_tmp[2]*2**8 + $src_tmp[3];
+			} elsif ($cur_fldtype == 12) {	# DST_IP
+				my @dst_tmp = unpack("C4", $cur_fldval);
+				$dstip = $dst_tmp[0]*2**24 + $dst_tmp[1]*2**16 + $dst_tmp[2]*2**8 + $dst_tmp[3];
+			} elsif ($cur_fldtype == 16) {	# SRC_AS
 				if ($cur_fldlen == 2) {
 					$srcas = unpack("n", $cur_fldval);
 				} elsif ($cur_fldlen == 4) {
@@ -415,32 +468,86 @@ sub parse_netflow_v10_data_flowset {
 				}
 			} elsif ($cur_fldtype == 60) {	# IP_PROTOCOL_VERSION
 				$ipversion = unpack("C", $cur_fldval);
-			} elsif ($cur_fldtype == 27 || $cur_fldtype == 28) {	# IPV6_SRC_ADDR/IPV6_DST_ADDR
+			} elsif ($cur_fldtype == 27) {	# IPV6_SRC_ADDR
 				$ipversion = 6;
+				$srcip = unpack("H4"x8,$cur_fldval);
+			} elsif ($cur_fldtype == 28) {	# IPV6_DST_ADDR
+				$ipversion = 6;
+				$dstip = unpack("H4"x8,$cur_fldval);
 			}
 		}
-	
+
+		$srcas_tmp = $memd->get($srcip);
+		$stats_memd_query++;
+		if (!defined($srcas_tmp)) {
+			$sth = $dbh->prepare("SELECT originas FROM iptoasn WHERE (MBRCONTAINS(ip_poly, POINTFROMWKB(POINT($srcip, 0)))) ORDER BY length DESC LIMIT 1");
+			$rows = $sth->execute();
+			if ((defined($rows)) && ($rows == 1)) {
+				my @res_srcas = $sth->fetchrow_array();
+				$sth->finish();
+				$stats_mysql_query++;
+				if ($res_srcas[0] >= 64512) { $res_srcas[0] = 0; };
+				if ($res_srcas[0] == $my_asn) { $res_srcas[0] = 0; };
+				$srcas = $res_srcas[0];
+				$memd->set($srcip, $srcas, 7200);
+			} else {
+				print "SRCIP: " . inet_ntoa(pack("N",$srcip)) . ", SRCAS: NOT FOUND\n";
+				$memd->set($srcip, $srcas, 600);
+				$stats_mysql_notf++;
+			}
+		} else {
+			$srcas = $srcas_tmp;
+			$stats_memd_hit++;
+		}
+
+		$dstas_tmp = $memd->get($dstip);
+		$stats_memd_query++;
+		if (!defined($dstas_tmp)) {
+			$sth = $dbh->prepare("SELECT originas FROM iptoasn WHERE (MBRCONTAINS(ip_poly, POINTFROMWKB(POINT($dstip, 0)))) ORDER BY length DESC LIMIT 1");
+			$rows = $sth->execute();
+			if ((defined($rows)) && ($rows == 1)) {
+				my @res_dstas = $sth->fetchrow_array();
+				$sth->finish();
+				$stats_mysql_query++;
+				if ($res_dstas[0] >= 64512) { $res_dstas[0] = 0; };
+				if ($res_dstas[0] == $my_asn) { $res_dstas[0] = 0; };
+				$dstas = $res_dstas[0];
+				$memd->set($dstip, $dstas, 7200);
+			} else {
+				print "DSTIP: " . inet_ntoa(pack("N",$dstip)) . ", DSTAS: NOT FOUND\n";
+				$memd->set($dstip, $dstas, 600);
+				$stats_mysql_notf++;
+			}
+		} else {
+			$dstas = $dstas_tmp;
+			$stats_memd_hit++;
+		}
+
+		#print "SRC IP: " . inet_ntoa(pack("N",$srcip)) . ", SRCAS: " . $res_srcas[0] ."/" . $srcas . ", DST IP: " . inet_ntoa(pack("N",$dstip)) . ", DSTAS: " . $res_dstas[0] . "/" . $dstas . ", INIF: " . $snmpin . ", OUTIF: " . $snmpout . "\n";
+
 		if (defined($srcas) && defined($dstas) && defined($snmpin) && defined($snmpout)) {
 			handleflow($ipaddr, $inoctets + $outoctets, $srcas, $dstas, $snmpin, $snmpout, $ipversion);
 		}
 	}
+	#print "MYSQL_Q: $stats_mysql_query, MYSQL_NF: $stats_mysql_notf, MYSQL_F: $stats_mysql_fail, MEMD_Q: $stats_memd_query, MEMD_H: $stats_memd_hit\n";
 }
 
 sub handleflow {
 	my ($routerip, $noctets, $srcas, $dstas, $snmpin, $snmpout, $ipversion) = @_;
-	
+
 	if ($srcas == 0 && $dstas == 0) {
-		# don't care about internal traffic
+		# don't care about internal traffic
+		#print "INTERNAL - " . inet_ntoa($routerip) . ", srcas:" . $srcas . ", dstas:" . $dstas . ", inif:" . $snmpin . ", outif:" . $snmpout . "\n";
 		return;
 	}
-	
-	print "$srcas => $dstas ($noctets octets, version $ipversion, snmpin $snmpin, snmpout $snmpout)\n";
-	
+
+	#print "$srcas => $dstas ($noctets octets, version $ipversion, snmpin $snmpin, snmpout $snmpout)\n";
+
 	# determine direction and interface alias name (if known)
 	my $direction;
 	my $ifalias;
 	my $as;
-	
+
 	if ($srcas == 0) {
 		$as = $dstas;
 		$direction = "out";
@@ -454,32 +561,33 @@ sub handleflow {
 		handleflow($routerip, $noctets, 0, $dstas, $snmpin, $snmpout, $ipversion);
 		return;
 	}
-	
+
 	if (!$ifalias) {
 		# ignore this, as it's through an interface we don't monitor
+		#print "IGNORING - " . inet_ntoa($routerip) . ", srcas:" . $srcas . ", dstas:" . $dstas . ", inif:" . $snmpin . ", outif:" . $snmpout . "\n";
 		return;
 	}
-	
+
 	my $dsname;
 	if ($ipversion == 6) {
-	 	$dsname = "${ifalias}_v6_${direction}";
+		$dsname = "${ifalias}_v6_${direction}";
 	} else {
-	 	$dsname = "${ifalias}_${direction}";
+		$dsname = "${ifalias}_${direction}";
 	}
-	
+
 	# put it into the cache
 	if (!$ascache->{$as}) {
 		$ascache->{$as} = {createts => time};
 	}
-	
+
 	$ascache->{$as}->{$dsname} += $noctets;
 	$ascache->{$as}->{updatets} = time;
-	
+
 	if ($ascache->{$as}->{updatets} == $ascache_lastflush) {
 		# cheat a bit here
 		$ascache->{$as}->{updatets}++;
 	}
-	
+
 	# now flush the cache, if necessary
 	flush_cache();
 }
@@ -511,36 +619,36 @@ sub flush_cache {
 
 	while (my ($as, $cacheent) = each(%$ascache)) {
 		if ($as % 10 == $ascache_flush_number % 10) {
-			print "$$: flushing data for AS $as ($cacheent->{updatets})\n";
-		
+			#print "$$: flushing data for AS $as ($cacheent->{updatets})\n";
+
 			my $rrdfile = getrrdfile($as, $cacheent->{updatets});
 			my @templatearg;
 			my @args;
-		
+
 			while (my ($dsname, $value) = each(%$cacheent)) {
 				next if ($dsname !~ /_(in|out)$/);
-				
+
 				my $tag = $dsname;
 				$tag =~ s/(_v6)?_(in|out)$//;
 				my $cursamplingrate = $samplingrate;
-				
+
 				if ($link_samplingrates{$tag}) {
 					$cursamplingrate = $link_samplingrates{$tag};
 				}
-			
+
 				push(@templatearg, $dsname);
 				push(@args, $value * $cursamplingrate);
 			}
-		
-		 	RRDs::update($rrdfile, "--template", join(':', @templatearg),
-		 		$cacheent->{updatets} . ":" . join(':', @args));
-		 	my $ERR = RRDs::error;
+
+			RRDs::update($rrdfile, "--template", join(':', @templatearg),
+				$cacheent->{updatets} . ":" . join(':', @args));
+			my $ERR = RRDs::error;
 			if ($ERR) {
 				print "Error updating RRD file $rrdfile: $ERR\n";
 			}
 		}
 	}
-	
+
 	exit 0;
 }
 
@@ -550,7 +658,7 @@ sub getrrdfile {
 	my $as = shift;
 	my $startts = shift;
 	$startts--;
-	
+
 	# we create 256 directories and store RRD files based on the lower
 	# 8 bytes of the AS number
 	my $dirname = "$rrdpath/" . sprintf("%02x", $as % 256);
@@ -558,15 +666,15 @@ sub getrrdfile {
 		# need to create directory
 		mkdir($dirname);
 	}
-	
+
 	my $rrdfile = "$dirname/$as.rrd";
 
 	# let's see if there's already an RRD file for this AS - if not, create one
 	if (! -r $rrdfile) {
-		print "$$: creating RRD file for AS $as\n";
-		
+		#print "$$: creating RRD file for AS $as\n";
+
 		my %links = map { $_, 1 } values %knownlinks;
-		
+
 		my @args;
 		foreach my $alias (keys %links) {
 			push(@args, "DS:${alias}_in:ABSOLUTE:300:U:U");
@@ -579,14 +687,14 @@ sub getrrdfile {
 		push(@args, "RRA:AVERAGE:0.99999:48:180");	# 1 month at 4 hour resolution
 		push(@args, "RRA:AVERAGE:0.99999:288:366");	# 1 year at 1 day resolution
 		RRDs::create($rrdfile, "--start", $startts, @args);
-		
+
 		my $ERR = RRDs::error;
 		if ($ERR) {
 			print "Error creating RRD file $rrdfile: $ERR\n";
 			return;
 		}
 	}
-	
+
 	return $rrdfile;
 }
 
@@ -597,16 +705,16 @@ sub read_knownlinks {
 	while (<KLFILE>) {
 		chomp;
 		next if (/(^\s*#)|(^\s*$)/);	# empty line or comment
-		
+
 		my ($routerip,$ifindex,$tag,$descr,$color,$samplingrate) = split(/\t+/);
 		$knownlinks_tmp{"${routerip}_${ifindex}"} = $tag;
-		
+
 		if ($samplingrate) {
 			$link_samplingrates_tmp{$tag} = $samplingrate;
 		}
 	}
 	close(KLFILE);
-	
+
 	%knownlinks = %knownlinks_tmp;
 	%link_samplingrates = %link_samplingrates_tmp;
 	return;
