@@ -34,6 +34,8 @@ my $v9_templates = {};
 my $v10_header_len = 16;
 my $v10_templates = {};
 
+my $iptoasn = 0;
+
 my $my_asn = 65536;
 my $stats_mysql_query = 0;
 my $stats_mysql_notf = 0;
@@ -72,6 +74,7 @@ if (defined($opt{'p'})) {
 	die("Server port is non numeric\n") if $server_port !~ /^[0-9]+$/;
 }
 
+
 # reap dead children
 $SIG{CHLD} = \&REAPER;
 $SIG{TERM} = \&TERM;
@@ -86,7 +89,9 @@ sub REAPER {
 
 sub TERM {
 	print "SIGTERM received\n";
-	$dbh->disconnect();
+	if ($iptoasn == 1) {
+		$dbh->disconnect();
+	}
 	exit 0;
 }
 
@@ -406,9 +411,12 @@ sub parse_netflow_v10_data_flowset {
 	my $sth;
 	my $rows = 0;
 
-	if ( not $dbh->ping ) {
-		print "MYSQL connection issue\n";
+	if ($iptoasn == 1) {
+		if ( not $dbh->ping ) {
+			print "MYSQL connection issue\n";
+		}
 	}
+
 	while (($ofs + $len) <= $datalen) {
 		# Interpret values according to template
 		my ($inoctets, $outoctets, $srcip, $dstip, $srcas, $dstas, $srcas_tmp, $dstas_tmp, $snmpin, $snmpout, $ipversion);
@@ -477,59 +485,61 @@ sub parse_netflow_v10_data_flowset {
 			}
 		}
 
-		$srcas_tmp = $memd->get($srcip);
-		$stats_memd_query++;
-		if (!defined($srcas_tmp)) {
-			$sth = $dbh->prepare("SELECT originas FROM iptoasn WHERE (MBRCONTAINS(ip_poly, POINTFROMWKB(POINT($srcip, 0)))) ORDER BY length DESC LIMIT 1");
-			$rows = $sth->execute();
-			if ((defined($rows)) && ($rows == 1)) {
-				my @res_srcas = $sth->fetchrow_array();
-				$sth->finish();
-				$stats_mysql_query++;
-				if ($res_srcas[0] >= 64512) { $res_srcas[0] = 0; };
-				if ($res_srcas[0] == $my_asn) { $res_srcas[0] = 0; };
-				$srcas = $res_srcas[0];
-				$memd->set($srcip, $srcas, 7200);
+		if ($iptoasn == 1) {
+			$srcas_tmp = $memd->get($srcip);
+			$stats_memd_query++;
+			if (!defined($srcas_tmp)) {
+				$sth = $dbh->prepare("SELECT originas FROM iptoasn WHERE (MBRCONTAINS(ip_poly, POINTFROMWKB(POINT($srcip, 0)))) ORDER BY length DESC LIMIT 1");
+				$rows = $sth->execute();
+				if ((defined($rows)) && ($rows == 1)) {
+					my @res_srcas = $sth->fetchrow_array();
+					$sth->finish();
+					$stats_mysql_query++;
+					if (($res_srcas[0] >= 64512) && ($res_srcas[0] <= 65534)) { $res_srcas[0] = 0; };
+					if ($res_srcas[0] == $my_asn) { $res_srcas[0] = 0; };
+					$srcas = $res_srcas[0];
+					$memd->set($srcip, $srcas, 7200);
+				} else {
+					print "SRCIP: " . inet_ntoa(pack("N",$srcip)) . ", SRCAS: NOT FOUND\n";
+					$memd->set($srcip, $srcas, 600);
+					$stats_mysql_notf++;
+				}
 			} else {
-				print "SRCIP: " . inet_ntoa(pack("N",$srcip)) . ", SRCAS: NOT FOUND\n";
-				$memd->set($srcip, $srcas, 600);
-				$stats_mysql_notf++;
+				$srcas = $srcas_tmp;
+				$stats_memd_hit++;
 			}
-		} else {
-			$srcas = $srcas_tmp;
-			$stats_memd_hit++;
-		}
 
-		$dstas_tmp = $memd->get($dstip);
-		$stats_memd_query++;
-		if (!defined($dstas_tmp)) {
-			$sth = $dbh->prepare("SELECT originas FROM iptoasn WHERE (MBRCONTAINS(ip_poly, POINTFROMWKB(POINT($dstip, 0)))) ORDER BY length DESC LIMIT 1");
-			$rows = $sth->execute();
-			if ((defined($rows)) && ($rows == 1)) {
-				my @res_dstas = $sth->fetchrow_array();
-				$sth->finish();
-				$stats_mysql_query++;
-				if ($res_dstas[0] >= 64512) { $res_dstas[0] = 0; };
-				if ($res_dstas[0] == $my_asn) { $res_dstas[0] = 0; };
-				$dstas = $res_dstas[0];
-				$memd->set($dstip, $dstas, 7200);
+			$dstas_tmp = $memd->get($dstip);
+			$stats_memd_query++;
+			if (!defined($dstas_tmp)) {
+				$sth = $dbh->prepare("SELECT originas FROM iptoasn WHERE (MBRCONTAINS(ip_poly, POINTFROMWKB(POINT($dstip, 0)))) ORDER BY length DESC LIMIT 1");
+				$rows = $sth->execute();
+				if ((defined($rows)) && ($rows == 1)) {
+					my @res_dstas = $sth->fetchrow_array();
+					$sth->finish();
+					$stats_mysql_query++;
+					if (($res_dstas[0] >= 64512) && ($res_dstas[0] <= 65534)) { $res_dstas[0] = 0; };
+					if ($res_dstas[0] == $my_asn) { $res_dstas[0] = 0; };
+					$dstas = $res_dstas[0];
+					$memd->set($dstip, $dstas, 7200);
+				} else {
+					print "DSTIP: " . inet_ntoa(pack("N",$dstip)) . ", DSTAS: NOT FOUND\n";
+					$memd->set($dstip, $dstas, 600);
+					$stats_mysql_notf++;
+				}
 			} else {
-				print "DSTIP: " . inet_ntoa(pack("N",$dstip)) . ", DSTAS: NOT FOUND\n";
-				$memd->set($dstip, $dstas, 600);
-				$stats_mysql_notf++;
+				$dstas = $dstas_tmp;
+				$stats_memd_hit++;
 			}
-		} else {
-			$dstas = $dstas_tmp;
-			$stats_memd_hit++;
-		}
 
-		#print "SRC IP: " . inet_ntoa(pack("N",$srcip)) . ", SRCAS: " . $res_srcas[0] ."/" . $srcas . ", DST IP: " . inet_ntoa(pack("N",$dstip)) . ", DSTAS: " . $res_dstas[0] . "/" . $dstas . ", INIF: " . $snmpin . ", OUTIF: " . $snmpout . "\n";
+			#print "SRC IP: " . inet_ntoa(pack("N",$srcip)) . ", SRCAS: " . $res_srcas[0] ."/" . $srcas . ", DST IP: " . inet_ntoa(pack("N",$dstip)) . ", DSTAS: " . $res_dstas[0] . "/" . $dstas . ", INIF: " . $snmpin . ", OUTIF: " . $snmpout . "\n";
+			print "MYSQL_Q: $stats_mysql_query, MYSQL_NF: $stats_mysql_notf, MYSQL_F: $stats_mysql_fail, MEMD_Q: $stats_memd_query, MEMD_H: $stats_memd_hit\n";
+		}
 
 		if (defined($srcas) && defined($dstas) && defined($snmpin) && defined($snmpout)) {
 			handleflow($ipaddr, $inoctets + $outoctets, $srcas, $dstas, $snmpin, $snmpout, $ipversion);
 		}
 	}
-	#print "MYSQL_Q: $stats_mysql_query, MYSQL_NF: $stats_mysql_notf, MYSQL_F: $stats_mysql_fail, MEMD_Q: $stats_memd_query, MEMD_H: $stats_memd_hit\n";
 }
 
 sub handleflow {
